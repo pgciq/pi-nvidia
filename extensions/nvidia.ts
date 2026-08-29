@@ -13,12 +13,14 @@
 // ai.api.nvidia.com/{riva,asr,tts,nemo,speech,genai}/<model> all return 404,
 // so there is no fixed hosted endpoint to call.
 
+import { execFile } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { Image, Markdown } from "@earendil-works/pi-tui";
+import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 
 const UNIFIED_BASE = "https://integrate.api.nvidia.com/v1";
 const IMAGE_GENAI_BASE = "https://ai.api.nvidia.com/v1/genai";
@@ -90,6 +92,77 @@ function isVLMId(id) {
 }
 function isImageId(id) {
   return IMAGE_MODELS.has(id);
+}
+
+// ---------------------------------------------------------------------------
+// Model metadata: context windows, max output tokens, capability flags
+// ---------------------------------------------------------------------------
+// NVIDIA's `GET /v1/models` returns ONLY { id, object, created, owned_by } — no
+// context window, no max tokens, no modalities, no pricing. So this table is
+// assembled from the per-model NIM docs (the `-infer` pages embed an OpenAPI
+// schema whose `max_tokens.maximum` is authoritative) plus model cards. Models
+// not listed here fall back to the 131072 / 65536 defaults from convertModel().
+const MODEL_INFO = {
+  // max_tokens.maximum === 8192 in the NIM OpenAPI schema for the 3.2V models
+  "meta/llama-3.2-11b-vision-instruct": { context: 131072, max: 8192 },
+  "meta/llama-3.2-90b-vision-instruct": { context: 131072, max: 8192 },
+  "openai/gpt-oss-20b": { context: 131072, max: 8192 },
+  "nvidia/llama-3.1-nemotron-51b-instruct": { context: 131072, max: 4096 },
+  "nvidia/nemotron-3-nano-30b-a3b": { context: 131072, max: 8192 },
+  // embedding models cap input at 512 tokens
+  "nvidia/nemotron-3-embed-1b": { context: 512, max: 512 },
+  "nvidia/embed-qa-4": { context: 512, max: 512 },
+  "nvidia/llama-3.2-nemoretriever-1b-vlm-embed-v1": { context: 512, max: 512 },
+  "microsoft/phi-3-vision-128k-instruct": { context: 131072, max: 2048 },
+  "microsoft/phi-3.5-vision-instruct": { context: 131072, max: 2048 },
+  "adept/fuyu-8b": { context: 2048, max: 2048 },
+  "nvidia/vila": { context: 2048, max: 2048 },
+};
+
+// Family fallback for the catalog models not listed above (NIM serves 80+).
+function infoFor(id) {
+  if (MODEL_INFO[id]) return MODEL_INFO[id];
+  if (isEmbeddingId(id)) return { context: 512, max: 512 };
+  if (/llama-3\.2|llama-3\.1|nemotron|mistral-large|mistral-small|qwen2\.5|qwen3|deepseek-v/i.test(id)) {
+    return { context: 131072, max: 8192 };
+  }
+  return {};
+}
+
+// Which lane a model belongs to — drives both the capability flags and the tables.
+function modelKind(id) {
+  if (isImageId(id)) return "imggen";
+  if (isEmbeddingId(id)) return "embed";
+  if (isVLMId(id)) return "vlm";
+  return "chat";
+}
+
+// Documented as reasoning/thinking-capable (NVIDIA's `enable_thinking`).
+const REASONING_MODELS = new Set([
+  "deepseek-ai/deepseek-r1",
+  "deepseek-ai/deepseek-r1-0528",
+  "moonshotai/kimi-k2-thinking",
+]);
+
+// Older / experimental VLMs that do not advertise tool calling.
+const NO_TOOLS = new Set([
+  "adept/fuyu-8b",
+  "microsoft/kosmos-2",
+  "nvidia/vila",
+  "nvidia/neva-22b",
+]);
+
+function capabilitiesFor(id) {
+  const kind = modelKind(id);
+  const lane = kind === "chat" || kind === "vlm";
+  return {
+    kind,
+    vision: kind === "vlm",
+    image: kind === "imggen",
+    embed: kind === "embed",
+    reasoning: lane && (/thinking/i.test(id) || REASONING_MODELS.has(id)),
+    tools: lane && !NO_TOOLS.has(id),
+  };
 }
 
 function convertModel(model) {
@@ -246,6 +319,165 @@ function streamNvidia(model, context, options) {
 }
 
 // ---------------------------------------------------------------------------
+// Commands: /nvidia-capabilities, /nvidia-context, /nvidia-usage
+// ---------------------------------------------------------------------------
+// NVIDIA exposes no usage/quota API, so /nvidia-usage can only point at the
+// build.nvidia.com web UI. Probed 2026-08-29:
+//   /v1/usage /v1/quotas /v1/accounts /v1/rate-limits /v1/billing -> 404
+//   build.nvidia.com/v1/analytics/{budget_usage,cli-summary}      -> text/html (SPA)
+//   chat-completion response headers                              -> no rate limits
+const USAGE_URL = "https://build.nvidia.com/explore";
+
+const CAP_FLAGS = {
+  vision: "vision",
+  image: "image",
+  embed: "embed",
+  reasoning: "reasoning",
+  tools: "tools",
+};
+
+const CONTEXT_SORT = { context: "contextWindow", max: "maxTokens" };
+
+function fmtSize(n) {
+  if (!n) return "—";
+  if (n >= 1_048_576) return `${Math.round(n / 1_048_576)}M`;
+  if (n >= 1024) return `${Math.round(n / 1024)}K`;
+  return String(n);
+}
+
+// notify() is a no-op outside TUI/RPC (ctx.hasUI === false in print/json modes),
+// so fall back to stdout for those callers.
+function notifyOrPrint(ctx, message, level = "warning") {
+  if (ctx.hasUI) ctx.ui.notify(message, level);
+  else console.log(message);
+}
+
+function openBrowser(url) {
+  const cmd =
+    process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
+  const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
+  try {
+    execFile(cmd, args, () => {});
+  } catch {
+    // Browser launch is best-effort; the URL is printed either way.
+  }
+}
+
+function buildCapabilitiesMarkdown(models, filter) {
+  const rows = models
+    .map((m) => ({ id: m.id, ...capabilitiesFor(m.id) }))
+    .filter((row) => !filter || row[CAP_FLAGS[filter]])
+    .sort((a, b) => a.kind.localeCompare(b.kind) || a.id.localeCompare(b.id));
+
+  const head = [`# NVIDIA NIM model capabilities${filter ? ` (filter: ${filter})` : ""}`, "", `_${rows.length} model(s)_`, ""];
+  if (rows.length === 0) return [...head, "_No NVIDIA models match that filter._"].join("\n");
+
+  const tick = (v) => (v ? "✓" : "—");
+  return [
+    ...head,
+    "| Model | Type | Vision | Image | Embed | Reasoning | Tools |",
+    "|---|---|:---:|:---:|:---:|:---:|:---:|",
+    ...rows.map(
+      (r) => `| ${r.id} | ${r.kind} | ${tick(r.vision)} | ${tick(r.image)} | ${tick(r.embed)} | ${tick(r.reasoning)} | ${tick(r.tools)} |`
+    ),
+    "",
+    "_From model cards + NIM docs: NVIDIA's `/v1/models` returns only `id/created/owned_by`, so it publishes no capability metadata. `reasoning`/`tools` are conservative._",
+  ].join("\n");
+}
+
+function buildContextMarkdown(models, sortKey, desc) {
+  const rows = models
+    .map((m) => {
+      const kind = modelKind(m.id);
+      const info = infoFor(m.id);
+      // Image models are prompt -> steps, not tokens, so token columns are n/a.
+      const tokenless = kind === "imggen";
+      return {
+        id: m.id,
+        kind,
+        contextWindow: tokenless ? 0 : info.context ?? m.contextWindow ?? 0,
+        maxTokens: tokenless ? 0 : info.max ?? m.maxTokens ?? 0,
+      };
+    })
+    .sort((a, b) => (desc ? b[sortKey] - a[sortKey] : a[sortKey] - b[sortKey]));
+
+  return [
+    `# NVIDIA NIM context & max output (sorted by ${sortKey}${desc ? " desc" : " asc"})`,
+    "",
+    "| Model | Type | Context | Max Out |",
+    "|---|---|---:|---:|",
+    ...rows.map((r) => `| ${r.id} | ${r.kind} | ${fmtSize(r.contextWindow)} | ${fmtSize(r.maxTokens)} |`),
+    "",
+    "_Image models show `—`: they take `steps`, not tokens. Values come from the NIM OpenAPI schema (`max_tokens.maximum`) + model cards — NVIDIA's `/v1/models` exposes no such fields, so unlisted models use the registered 131072/65536 defaults._",
+  ].join("\n");
+}
+
+function nvidiaModels(ctx) {
+  return ctx.modelRegistry.getAvailable().filter((m) => m.provider === "nvidia");
+}
+
+function registerNvidiaCommands(pi) {
+  const registerMarkdownCommand = (name, description, getArgumentCompletions, build) => {
+    pi.registerCommand(name, {
+      description,
+      getArgumentCompletions,
+      handler: async (args, ctx) => {
+        const models = nvidiaModels(ctx);
+        if (models.length === 0) {
+          notifyOrPrint(ctx, "No NVIDIA NIM models available — set NVIDIA_NIM_API_KEY and restart pi.");
+          return;
+        }
+        const markdown = build(args, models);
+        if (ctx.mode === "tui") pi.appendEntry(name, { markdown });
+        else if (ctx.hasUI) ctx.ui.notify(markdown, "info");
+        else console.log(markdown);
+      },
+    });
+    pi.registerEntryRenderer?.(name, (entry) => new Markdown(entry.data?.markdown ?? "", 1, 0, getMarkdownTheme()));
+  };
+
+  const tokensOf = (args) => (args || "").trim().split(/\s+/).filter(Boolean);
+  const completionsFor = (values) => (prefix) => {
+    const items = values.map((value) => ({ value, label: value }));
+    const filtered = items.filter((i) => i.value.startsWith(prefix));
+    return filtered.length > 0 ? filtered : null;
+  };
+
+  registerMarkdownCommand(
+    "nvidia-capabilities",
+    "List NVIDIA NIM model capabilities (vision/image/embed/reasoning/tools); e.g. /nvidia-capabilities vision",
+    completionsFor(Object.keys(CAP_FLAGS)),
+    (args, models) => buildCapabilitiesMarkdown(models, tokensOf(args).find((t) => t in CAP_FLAGS)),
+  );
+
+  registerMarkdownCommand(
+    "nvidia-context",
+    "List NVIDIA NIM context window / max output, sortable; e.g. /nvidia-context context desc",
+    completionsFor([...Object.keys(CONTEXT_SORT), "asc", "desc"]),
+    (args, models) => {
+      const tokens = tokensOf(args);
+      const sortKey = CONTEXT_SORT[tokens.find((t) => t in CONTEXT_SORT) ?? "context"];
+      return buildContextMarkdown(models, sortKey, tokens.includes("desc"));
+    },
+  );
+
+  pi.registerCommand("nvidia-usage", {
+    description: "Open the NVIDIA NIM usage/quota page (NVIDIA exposes no usage API to query).",
+    handler: async (_args, ctx) => {
+      openBrowser(USAGE_URL);
+      const note =
+        "NVIDIA NIM has **no usage/quota API** — probed: `/v1/usage`, `/v1/quotas`, `/v1/accounts`, " +
+        "`/v1/rate-limits`, `/v1/billing` all return 404; `build.nvidia.com/v1/analytics/*` returns " +
+        "SPA HTML instead of JSON; chat responses carry no rate-limit headers.\n\n" +
+        `Opened in your browser: ${USAGE_URL}`;
+      if (ctx.mode === "tui") pi.appendEntry("nvidia-usage", { markdown: `# NVIDIA NIM usage\n\n${note}` });
+      else notifyOrPrint(ctx, note, "info");
+    },
+  });
+  pi.registerEntryRenderer?.("nvidia-usage", (entry) => new Markdown(entry.data?.markdown ?? "", 1, 0, getMarkdownTheme()));
+}
+
+// ---------------------------------------------------------------------------
 // Riva (ASR / TTS) — PLACEHOLDER, NOT WIRED
 // ---------------------------------------------------------------------------
 // Riva models (parakeet / canary ASR, chatterbox TTS) are self-hosted NIMs.
@@ -288,6 +520,8 @@ export default function (pi) {
       return new Markdown(`Generated image unavailable: ${fileLink(image.path ?? "unknown path")}`, 1, 0, theme);
     }
   });
+
+  registerNvidiaCommands(pi);
 
   pi.registerProvider("nvidia", {
     name: "NVIDIA NIM",

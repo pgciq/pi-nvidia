@@ -65,6 +65,68 @@ call:
 
 `streamRivaASR` / `streamRivaTTS` exist as stubs but are **not dispatched**.
 
+## Commands
+
+Three commands show what a provider usually advertises. Tab-completion is
+provided after `/nvidia-…`.
+
+### `/nvidia-capabilities [vision|image|embed|reasoning|tools]`
+
+Per-model capability table; the optional filter narrows to models that have that
+capability.
+
+```
+/nvidia-capabilities
+/nvidia-capabilities vision
+```
+
+| Model | Type | Vision | Image | Embed | Reasoning | Tools |
+|---|---|:---:|:---:|:---:|:---:|:---:|
+| openai/gpt-oss-20b | chat | — | — | — | — | ✓ |
+| nvidia/llama-3.2-nemoretriever-1b-vlm-embed-v1 | embed | — | — | ✓ | — | — |
+| black-forest-labs/flux.1-schnell | imggen | — | ✓ | — | — | — |
+| meta/llama-3.2-11b-vision-instruct | vlm | ✓ | — | — | — | ✓ |
+
+### `/nvidia-context [context|max] [asc|desc]`
+
+Context window and max output tokens, sortable. Defaults to `context asc`.
+
+```
+/nvidia-context max desc
+```
+
+### `/nvidia-usage`
+
+Opens the build.nvidia.com usage page in your browser. There is deliberately no
+data table — **NVIDIA exposes no usage/quota API.** Probed 2026-08-29:
+
+| Endpoint | Result |
+|---|---|
+| `/v1/usage` · `/v1/quotas` · `/v1/accounts` · `/v1/rate-limits` · `/v1/billing` | 404 |
+| `build.nvidia.com/v1/analytics/budget_usage` | `text/html` (SPA, not JSON) |
+| `build.nvidia.com/v1/analytics/cli-summary` | `text/html` (SPA, not JSON) |
+| chat-completion response headers | no rate-limit headers |
+
+Usage/quota is only visible in the build.nvidia.com web UI (session login, not
+the `nvapi-…` API key).
+
+### Where the capability and context numbers come from
+
+`GET /v1/models` and `GET /v1/models/{id}` both return only
+`{ id, object, created, owned_by }` — NVIDIA publishes **no** context window,
+max tokens, modality, or pricing metadata. So:
+
+- **Context / max output** — from each model's NIM docs page, which embeds an
+  OpenAPI schema (`max_tokens.maximum` is authoritative, e.g. 8192 for the
+  Llama 3.2 Vision models), plus model cards. Unlisted models fall back to the
+  registered `131072 / 65536` defaults, and the table says so. Image models show
+  `—` because they take `steps`, not tokens.
+- **Capabilities** — `vision` / `image` / `embed` are derived from the model id
+  (VLM set, image-gen set, `embed` in the name) and are reliable. `reasoning` /
+  `tools` come from model cards and are conservative: live verification was
+  blocked because `integrate.api.nvidia.com` was returning HTTP 500 for every
+  request while this was written.
+
 ## Notes
 
 - The seed list is a representative subset; the full chat/VLM/embedding catalog
