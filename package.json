@@ -1,6 +1,6 @@
 {
   "name": "pi-nvidia",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Pi extension for NVIDIA NIM — chat, vision (VLM), embeddings, and image generation",
   "keywords": [
     "pi-package",
