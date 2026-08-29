@@ -1,0 +1,9 @@
+node_modules/
+.vscode/
+
+.codegraph/
+.omo/
+
+# Tool workspace dirs (runtime artifacts — do not commit)
+.pi/
+.pi-web/

@@ -1,0 +1,42 @@
+{
+  "name": "pi-nvidia",
+  "version": "0.1.0",
+  "description": "Pi extension for NVIDIA NIM — chat, vision (VLM), embeddings, and image generation",
+  "keywords": [
+    "pi-package",
+    "nvidia",
+    "nim",
+    "genai",
+    "flux",
+    "stable-diffusion"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pgciq/pi-nvidia"
+  },
+  "files": [
+    "extensions",
+    "README.md"
+  ],
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "dependencies": {
+    "@earendil-works/pi-tui": "^0.84.3"
+  }
+}
