@@ -185,10 +185,10 @@ function convertModel(model) {
   };
 }
 
-async function fetchModels(baseUrl, signal) {
-  const apiKey = process.env[API_KEY_ENV];
+async function fetchModels(baseUrl, signal, apiKey) {
+  const key = apiKey ?? process.env[API_KEY_ENV];
   const headers = {};
-  if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+  if (key) headers["Authorization"] = `Bearer ${key}`;
 
   const res = await fetch(`${baseUrl}/models`, { headers, redirect: "follow", signal });
   if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
@@ -264,7 +264,7 @@ function streamImageGeneration(model, context, options) {
       stream.push({ type: "start", partial: output });
       const prompt = latestTextPrompt(context);
       if (!prompt) throw new Error("Image generation requires a text prompt");
-      const apiKey = process.env[API_KEY_ENV];
+      const apiKey = options?.apiKey ?? process.env[API_KEY_ENV];
       if (!apiKey) throw new Error(`${API_KEY_ENV} env var is required for image generation`);
 
       const endpoint = `${IMAGE_GENAI_BASE}/${model.id}`;
@@ -523,44 +523,55 @@ export default function (pi) {
 
   registerNvidiaCommands(pi);
 
-  pi.registerProvider("nvidia", {
-    name: "NVIDIA NIM",
+  let currentModels = SEED.map((id) => convertModel({ id }));
+  const provider = {
     baseUrl,
-    // Keep this as an env reference even when the variable is absent. Pi can
-    // then mark the provider as unconfigured instead of using a placeholder key.
-    apiKey: `$${apiKeyEnv}`,
-    api: "openai-completions",
+    auth: {
+      apiKey: {
+        name: "NVIDIA NIM API Key",
+        async login(interaction) {
+          const key = await interaction.prompt({ type: "secret", message: "NVIDIA NIM API Key" });
+          if (!key.trim()) throw new Error("NVIDIA NIM API Key cannot be empty");
+          return { type: "api_key", key: key.trim() };
+        },
+        async resolve({ credential, ctx }) {
+          const key = credential?.key ?? await ctx.env(apiKeyEnv);
+          return key ? { auth: { apiKey: key }, source: credential?.key ? "stored API key" : apiKeyEnv } : undefined;
+        },
+      },
+    },
+    getModels: () => currentModels,
+    get models() { return currentModels; },
     streamSimple: streamNvidia,
-    models: SEED.map((id) => convertModel({ id })),
-
-    async refreshModels({ signal, stored, publish, allowNetwork }) {
+    async refreshModels({ signal, stored, publish, allowNetwork, credential }) {
       const cachedModels = Array.isArray(stored?.models) ? stored.models : undefined;
       const seedModels = SEED.map((id) => convertModel({ id }));
+      if (cachedModels?.length) currentModels = cachedModels;
+      if (allowNetwork === false || signal.aborted) return currentModels;
 
-      if (allowNetwork === false || signal.aborted) {
-        return cachedModels?.length ? cachedModels : seedModels;
-      }
-
-      let models;
       try {
-        const fetched = await fetchModels(UNIFIED_BASE, signal);
-        // Image-generation models live on the separate genai host and are not
-        // in the unified /v1/models catalog — merge them in explicitly.
+        const fetched = await fetchModels(UNIFIED_BASE, signal, credential?.key);
         const seen = new Set(fetched.map((m) => m.id));
         for (const id of IMAGE_MODELS) {
           if (!seen.has(id)) fetched.push(convertModel({ id }));
         }
-        models = fetched;
+        if (fetched.length > 0) {
+          currentModels = fetched;
+          await publish({ persist: { provider: "nvidia", models: fetched } });
+        }
       } catch {
-        return cachedModels?.length ? cachedModels : seedModels;
+        // Keep the cached or seed catalog on discovery failure.
       }
-
-      if (models.length > 0) {
-        await publish({ persist: { provider: "nvidia", models } });
-        return models;
-      }
-
-      return cachedModels?.length ? cachedModels : seedModels;
+      return currentModels.length ? currentModels : seedModels;
     },
+  };
+  pi.registerProvider(provider.id, {
+    name: provider.name,
+    baseUrl: provider.baseUrl,
+    api: "openai-completions",
+    apiKey: "$NVIDIA_NIM_API_KEY",
+    streamSimple: provider.streamSimple,
+    models: provider.getModels(),
+    refreshModels: provider.refreshModels,
   });
 }
