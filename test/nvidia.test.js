@@ -6,8 +6,8 @@ function loadExtension() {
   let config;
   const commands = new Map();
   extension({
-    registerProvider(_name, providerConfig) {
-      config = providerConfig;
+    registerProvider(...args) {
+      config = args.length === 1 ? args[0] : args[1];
     },
     registerCommand(name, options) {
       commands.set(name, options);
